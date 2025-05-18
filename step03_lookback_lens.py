@@ -6,6 +6,7 @@ import transformers
 import pickle
 from tqdm import tqdm
 import os
+import pandas as pd
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression
@@ -299,40 +300,66 @@ def convert_to_token_level(lookback_tensor, labels, sliding_window=8, sequential
     return lookback_tensor_token_level, labels_token_level
 
 
-def extract_time_series_features(lookback_tensor):
+# def extract_time_series_features(lookback_tensor):
+#     features = []
+#     num_examples = len(lookback_tensor)
+#     num_layers, num_heads = lookback_tensor[0].shape[:2]
+#     # Loop over each example to extract features
+#     baseline_predictions = []
+#     detailed_feature_names = []
+#     for i in tqdm(range(num_examples)):
+#         example_org = lookback_tensor[i]
+#         example = example_org.clone()
+#         example = example.view(-1, example.shape[2])
+#         example = example.transpose(0, 1)
+#         # shape: (num_new_tokens, num_layers * num_heads)
+#         # Baseline: Assume higher lookback ratio means less hallucination
+#         baseline_predictions.append(example.mean(dim=1).mean(0).item())
+
+#         # Feature names are: means-L1-H1, means-L1-H2, ..., means-L2-H1, ...
+#         # L means layers, H means heads, they are flattened in the feature vector (32*32=1024) for each token position
+#         if i == 0:
+#             h_index = 0
+#             for l in range(num_layers):
+#                 for h in range(num_heads):
+#                     detailed_feature_names.append(
+#                         f"lookback-mean-L{l}-H{h}")
+#                     h_index += 1
+
+#         # Concatenate the features into a vector
+#         feature_vector = example.mean(dim=0).numpy()
+#         if np.isnan(feature_vector).any():
+#             raise ValueError("NaN detected in the feature vector")
+#         features.append(feature_vector)
+
+#     return np.array(features), detailed_feature_names, baseline_predictions
+
+def extract_time_series_features(lookback_tensor, layer_idx=None):
     features = []
-    num_examples = len(lookback_tensor)
-    num_layers, num_heads = lookback_tensor[0].shape[:2]
-    # Loop over each example to extract features
     baseline_predictions = []
-    detailed_feature_names = []
-    for i in tqdm(range(num_examples)):
-        example_org = lookback_tensor[i]
-        example = example_org.clone()
-        example = example.view(-1, example.shape[2])
-        example = example.transpose(0, 1)
-        # shape: (num_new_tokens, num_layers * num_heads)
-        # Baseline: Assume higher lookback ratio means less hallucination
-        baseline_predictions.append(example.mean(dim=1).mean(0).item())
+    feature_names = []
 
-        # Feature names are: means-L1-H1, means-L1-H2, ..., means-L2-H1, ...
-        # L means layers, H means heads, they are flattened in the feature vector (32*32=1024) for each token position
-        if i == 0:
-            h_index = 0
-            for l in range(num_layers):
-                for h in range(num_heads):
-                    detailed_feature_names.append(
-                        f"lookback-mean-L{l}-H{h}")
-                    h_index += 1
+    for example in tqdm(lookback_tensor):
+        if layer_idx is not None:
+            # example shape: (L, H, T)
+            layer_attn = example[layer_idx]  # shape: (H, T)
+            mean_per_head = layer_attn.mean(dim=1).numpy()  # shape: (H,)
+            features.append(mean_per_head)
+            if not feature_names:
+                feature_names = [f"Layer{layer_idx}-Head{h}" for h in range(layer_attn.shape[0])]
+            baseline_predictions.append(mean_per_head.mean())  # 단순 평균 baseline
+        else:
+            # 기존 방식 (모든 L, H flatten)
+            flat = example.view(-1, example.shape[2]).transpose(0, 1)  # shape: (T, L*H)
+            feature_vector = flat.mean(dim=0).numpy()
+            features.append(feature_vector)
+            if not feature_names:
+                for l in range(example.shape[0]):
+                    for h in range(example.shape[1]):
+                        feature_names.append(f"lookback-mean-L{l}-H{h}")
+            baseline_predictions.append(flat.mean().item())
 
-        # Concatenate the features into a vector
-        feature_vector = example.mean(dim=0).numpy()
-        if np.isnan(feature_vector).any():
-            raise ValueError("NaN detected in the feature vector")
-        features.append(feature_vector)
-
-    return np.array(features), detailed_feature_names, baseline_predictions
-
+    return np.array(features), feature_names, baseline_predictions
 
 def main(anno_file_1, attn_file_1, anno_file_2, attn_file_2, 
          sliding_window=8, 
@@ -416,9 +443,15 @@ def main(anno_file_1, attn_file_1, anno_file_2, attn_file_2,
                     important_features = sorted(
                         zip(feature_names, feature_importance), key=lambda x: abs(x[1]), reverse=True)
 
-                print("Top-10 important features:")
-                for feature, importance in important_features[:10]:
-                    print(f"{feature}: {importance:.9f}")
+                # print("Top-10 important features:")
+                # for feature, importance in important_features[:10]:
+                #     print(f"{feature}: {importance:.9f}")
+                
+                df_imp = pd.DataFrame(important_features, columns=['feature', 'importance'])
+                csv_path = 'feature_importances.csv'
+                df_imp.to_csv(csv_path, index=False)
+
+                print(f"Saved all feature importances to {csv_path}")
 
             total_train_auroc /= len(datasets)
             total_test_auroc /= len(datasets)
@@ -439,7 +472,13 @@ def main(anno_file_1, attn_file_1, anno_file_2, attn_file_2,
         if output_path is not None:
             output_file = os.path.join(output_path, output_file)
         with open(output_file, 'wb') as f:
-            pickle.dump({'clf': classifier}, f)
+            important_features = list(zip(feature_names, classifier.coef_[0]))
+            pickle.dump({
+                'clf': classifier,
+                'feature_names': feature_names,
+                'important_features': important_features
+            }, f)
+
 
         # Transfer the classifier to the other dataset
         print(
@@ -477,6 +516,34 @@ def main(anno_file_1, attn_file_1, anno_file_2, attn_file_2,
     names = [' '*width, f'A={file_1};B={file_2}', f'A={file_2};B={file_1}']
     for i, row in enumerate(output_small_table):
         print(', '.join([names[i]]+[str(x) for x in row]))
+    if is_feat:
+        all_layer_results = []
+        for layer in range(num_layers):
+            print(f"\n=== Probing Layer {layer} ===")
+
+            features, names, baseline_preds = extract_time_series_features(lookback_tensor, layer_idx=layer)
+            X_train, X_test, y_train, y_test = train_test_split(features, labels, test_size=0.2, random_state=42)
+
+            clf = LogisticRegression(max_iter=1000)
+            clf.fit(X_train, y_train)
+
+            train_auc = roc_auc_score(y_train, clf.predict_proba(X_train)[:, 1])
+            test_auc = roc_auc_score(y_test, clf.predict_proba(X_test)[:, 1])
+            print(f"Train AUROC: {train_auc:.4f}, Test AUROC: {test_auc:.4f}")
+
+            all_layer_results.append((layer, train_auc, test_auc))
+
+            # # 저장 (optional)
+            # with open(f'classifier_layer{layer}.pkl', 'wb') as f:
+            #     pickle.dump({
+            #         'clf': clf,
+            #         'feature_names': names,
+            #         'important_features': list(zip(names, clf.coef_[0]))
+            #     }, f)
+        df_results = pd.DataFrame(all_layer_results, columns=['layer', 'train_auc', 'test_auc'])
+        df_results.to_csv("layerwise_auroc_results.csv", index=False)
+
+    
 
 
 if __name__ == "__main__":

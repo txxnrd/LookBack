@@ -2,11 +2,22 @@
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from transformers.generation.stopping_criteria import StoppingCriteriaList, LLamaQaStoppingCriteria
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers.generation import StoppingCriteria, StoppingCriteriaList
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
-
 import numpy as np
+
+class StopWordsCriteria(StoppingCriteria):
+    def __init__(self, stop_ids_list):
+        super().__init__()
+        self.stop_ids_list = stop_ids_list
+
+    def __call__(self, input_ids, scores, **kwargs):
+        sequence = input_ids[0].tolist()
+        for stop_ids in self.stop_ids_list:
+            if sequence[-len(stop_ids):] == stop_ids:
+                return True
+        return False
 
 class LLM:
     def __init__(self, model_name, device, num_gpus, auth_token=None, max_memory=40, **kwargs):
@@ -42,16 +53,13 @@ class LLM:
         else:
             raise ValueError(f"Invalid device: {self.device}")
         
-        # low_cpu_mem_usage = True if not '70b' in model_name else False
         if auth_token is not None:
             tokenizer = AutoTokenizer.from_pretrained(model_name, token=auth_token)
             model = AutoModelForCausalLM.from_pretrained(model_name,
-                # low_cpu_mem_usage=True, 
                 token=auth_token, **kwargs)
         else:
             tokenizer = AutoTokenizer.from_pretrained(model_name)
             model = AutoModelForCausalLM.from_pretrained(model_name,
-                # low_cpu_mem_usage=True, 
                 **kwargs)
 
         if self.device == "cuda" and self.num_gpus == 1:
@@ -70,7 +78,7 @@ class LLM:
                 stop_word_ids = self.tokenizer.encode('\n' + stop_word)
             list_stop_word_ids.append(stop_word_ids)
             print("Added stop word: ", stop_word, 'with the ids', stop_word_ids, flush=True)
-        self.stopping_criteria.append(LLamaQaStoppingCriteria(list_stop_word_ids))
+        self.stopping_criteria.append(StopWordsCriteria(list_stop_word_ids))
 
     def generate(self, input_text, max_new_tokens=256, top_p=0.95, top_k=0, temperature=0.8, mode='vanilla', verbose=True, remove_stop_words=False, return_attentions=False, guiding_classifier=None, chunk_size=None, num_candidates=None, conversion_matrix=None, extra_prompt_length=None, teacher_forcing_seq=None, **kwargs):
         with torch.no_grad():
