@@ -12,8 +12,6 @@ from tqdm import tqdm
 import argparse
 import pickle
 from rag.wiki_live_chain import build_wiki_live_chain
-
-
 from generation import LLM
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -252,17 +250,16 @@ if __name__ == "__main__":
     else:
         list_data_dict = load_jsonl(fp, parallel=args.parallel, total_shard=args.total_shard, shard_id=args.shard_id, debug=args.debug, data_type=args.data_type, subsample=args.subsample)
     
-    # llm = LLM(
-    #     model_name, device, num_gpus, 
-    #     auth_token=args.auth_token, 
-    #     max_memory=args.max_memory)
-    # ─────────────────────────────
-    # 1) LLM 대신 Wiki-RAG 체인 준비
-    # ─────────────────────────────
-    rag_chain = build_wiki_live_chain(model_name=args.model_name,
-                                    device=args.device)
-    base_llm  = rag_chain.llm          # 토크나이저만 필요할 때 사용
-
+    llm = LLM(
+        model_name, device, num_gpus, 
+        auth_token=args.auth_token, 
+        max_memory=args.max_memory)
+    wiki_retriever, base_tokenizer = build_wiki_live_chain(
+        model_name=args.model_name,
+        device=args.device,
+        return_retriever_only=True,
+    )
+    
     stop_word_list = ["### User:", "Q:", "\\end{code}", "#Document#:",
                     "#Pondering#:", "#Question#:", "#Dialogue History#:"]
 
@@ -276,7 +273,7 @@ if __name__ == "__main__":
             model = CrossEncoder(args.guiding_classifier)
             guiding_classifier = {
                 "model": model,
-                "tokenizer": base_llm.tokenizer,
+                "tokenizer": base_tokenizer,
                 "is_cross_encoder": True,
                 "is_deberta": False,
             }
@@ -321,8 +318,32 @@ if __name__ == "__main__":
             question = sample["context"].split("#Question#:")[-1].split("\n")[0].strip()
 
         # 4-2 Wiki-RAG 호출
-        answer = rag_chain({"query": question})["result"]
+        #answer = rag_chain({"query": question})["result"]
+        docs = wiki_retriever(question)
+        context_txt = "\n\n".join(d.page_content for d in docs)
+            # 4-3  프롬프트 조립 (토큰 컷 포함)
+        prompt = build_prompt(
+            f"#Document#:\n{context_txt}",
+            "\n#Answer#:",
+            data_type=args.data_type,
+            llama2_tokenizer=base_tokenizer,
+        )
 
+        # 4-4  Lookback Lens 디코딩
+        raw_outputs = llm.generate(
+            prompt,
+            chunk_size=args.chunk_size,
+            num_candidates=args.num_candidates,
+            max_new_tokens=args.max_new_tokens,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            temperature=args.temperature,
+            do_sample=args.do_sample,
+            stop=stop_word_list,
+            forced_truncate=forced_truncate,
+        )
+        answer = raw_outputs[0] if isinstance(raw_outputs, (list, tuple)) else raw_outputs
+        
         # 4-3 stop-word 클리핑
         for sw in stop_word_list:
             if answer.endswith(sw):
